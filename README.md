@@ -1,123 +1,255 @@
-# Zomato AI Data Engineering — End-to-End Project
+# Zomato AI Data Engineering — End-to-End
 
-> 🎥 **Video walkthrough:** [Watch the full project tutorial on YouTube](https://youtu.be/kYwaNMQ3XT8?si=Ge8ilVxkmGQS6iIg)
+An end-to-end batch data platform for large-scale food-delivery analytics. The project lands CSV data in Amazon S3, loads it into Snowflake, transforms it through a dbt medallion architecture, orchestrates daily processing with Apache Airflow, and adds AI-powered review analysis, retrieval, and natural-language querying.
 
-A complete batch data pipeline that takes Zomato-style food delivery data from raw CSVs all the way to AI-powered analytics:
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
+![Snowflake](https://img.shields.io/badge/Snowflake-Data_Warehouse-29B5E8?logo=snowflake&logoColor=white)
+![dbt](https://img.shields.io/badge/dbt-Transformation-FF694B?logo=dbt&logoColor=white)
+![Airflow](https://img.shields.io/badge/Apache_Airflow-Orchestration-017CEE?logo=apacheairflow&logoColor=white)
+![OpenAI](https://img.shields.io/badge/OpenAI-AI_Layer-412991?logo=openai&logoColor=white)
 
-**Zomato/Food Delivery Dataset → Amazon S3 → Snowflake → dbt → Airflow → AI (OpenAI)**
+## Architecture
 
-The dataset lands in an S3 data lake and flows into Snowflake through a storage integration, where dbt transforms it through medallion layers — RAW (Bronze) tables loaded via `COPY INTO`, cleaned STAGING (Silver) views, and business-ready MARTS (Gold) with dimensions, incremental facts, and aggregate marts. Apache Airflow orchestrates the whole pipeline as one daily DAG. On top of the warehouse sits an AI lane powered by OpenAI: LLM enrichment turns free-text reviews into structured, queryable columns; RAG lets you chat with your reviews; and text-to-SQL lets you query the warehouse in plain English. Streamlit serves the dashboards and AI apps.
+![Zomato data platform architecture](docs/architecture.png)
 
-![Architecture](docs/architecture.png)
+```mermaid
+flowchart LR
+    CSV[Zomato CSV files] --> S3[(Amazon S3 data lake)]
+    S3 --> RAW[(Snowflake RAW)]
+    RAW --> STG[dbt STAGING views]
+    STG --> MARTS[(dbt MARTS)]
+    MARTS --> DASH[Analytics and dashboards]
+    RAW --> ENRICH[OpenAI review enrichment]
+    ENRICH --> AI[(Snowflake AI schema)]
+    AI --> RAG[RAG review chat]
+    MARTS --> SQL[Text-to-SQL app]
+    AIRFLOW[Apache Airflow] -. orchestrates .-> RAW
+    AIRFLOW -.-> STG
+    AIRFLOW -.-> ENRICH
+    AIRFLOW -.-> MARTS
+```
 
-> 📂 **Dataset + project slides:** [Google Drive folder](https://drive.google.com/drive/folders/1FEnGWMHhHzzTUCZOw1-YnH2v3DMuM-rs?usp=sharing) — download the CSVs here and place them under `data/` (they're too large to commit to the repo).
+## What the project builds
 
-## What gets built
-
-| Layer | Where | What |
+| Layer | Technology | Responsibility |
 |---|---|---|
-| **Source** | `data/` (local) | 4 real dimension CSVs (restaurants, users, food, menu) + 3 generated fact files: **10M orders**, **~23M order items**, **300K free-text reviews** |
-| **Lake** | Amazon S3 | One bucket, `raw/<table>/` folder per CSV |
-| **Bronze** | Snowflake `ZOMATO.RAW` | `COPY INTO` from S3 via a keyless storage integration |
-| **Silver** | Snowflake `ZOMATO.STAGING` | dbt staging views — clean, type, rename every source |
-| **Gold** | Snowflake `ZOMATO.MARTS` | Dimensions, **incremental** facts (MERGE), business marts + an SCD2 snapshot |
-| **AI** | Snowflake `ZOMATO.AI` | LLM-enriched reviews (sentiment/topic), RAG chat, text-to-SQL |
-| **Orchestration** | Airflow (Docker) | One daily DAG: load → transform → enrich → AI mart |
+| Source | CSV | Restaurant, customer, food, menu, order, order-item, and review records |
+| Data lake | Amazon S3 | Durable raw storage organized by source table |
+| Bronze | Snowflake `RAW` | Source-shaped tables loaded with `COPY INTO` |
+| Silver | dbt `STAGING` | Typed, renamed, standardized, and validated views |
+| Gold | dbt `MARTS` | Dimensions, incremental facts, and business-facing aggregates |
+| AI | Snowflake `AI` + OpenAI | Structured review enrichment, RAG, and guarded text-to-SQL |
+| Orchestration | Apache Airflow | Daily dependency-aware execution of the entire batch pipeline |
 
-## Tech stack
+The intended large-volume run includes approximately 10 million orders, 23 million order items, and 300,000 free-text reviews. Large source files are intentionally excluded from version control.
 
-Python · Pandas · Amazon S3 · Snowflake · dbt (dbt-snowflake) · Apache Airflow 3 (Docker) · OpenAI (`gpt-4o-mini`, `text-embedding-3-small`) · Streamlit
+## Pipeline walkthrough
+
+### 1. Land source files in S3
+
+Seven CSV datasets are uploaded under table-specific prefixes:
+
+```text
+s3://<bucket>/raw/restaurants/
+s3://<bucket>/raw/users/
+s3://<bucket>/raw/food/
+s3://<bucket>/raw/menu/
+s3://<bucket>/raw/orders/
+s3://<bucket>/raw/order_items/
+s3://<bucket>/raw/reviews/
+```
+
+### 2. Connect Snowflake without stored access keys
+
+Snowflake accesses S3 through a storage integration and a restricted IAM role. The required AWS policy documents are under [`aws/iam/`](aws/iam/).
+
+```mermaid
+sequenceDiagram
+    participant AWS as AWS IAM
+    participant SF as Snowflake
+    participant S3 as Amazon S3
+
+    AWS->>AWS: Create read-only S3 policy and IAM role
+    AWS->>SF: Supply IAM role ARN
+    SF->>SF: Create storage integration
+    SF-->>AWS: Return Snowflake IAM user ARN and external ID
+    AWS->>AWS: Update role trust policy
+    SF->>S3: Read approved raw-data prefixes
+```
+
+The final trust policy must use Snowflake's IAM user ARN and external ID. Recreating the integration can generate a new external ID and invalidate the existing trust relationship.
+
+### 3. Load the bronze layer
+
+Snowflake `COPY INTO` commands load the S3 files into source-shaped tables in `ZOMATO.RAW`. Credentials remain outside SQL and application code.
+
+### 4. Transform with dbt
+
+The dbt project in [`zomato/`](zomato/) implements the warehouse model:
+
+- **Staging views:** standardize types, names, email casing, missing values, and delivery flags.
+- **Dimensions:** restaurants, customers with age segments, food items, and a generated calendar.
+- **Incremental facts:** orders and order items use Snowflake `MERGE` behavior to process new records efficiently.
+- **Business marts:** daily city revenue, restaurant performance, delivery SLA percentiles, and review insights.
+- **Quality checks:** uniqueness, nullability, relationships, accepted values, and reconciliation tests.
+
+```mermaid
+flowchart TB
+    SRC[(RAW sources)] --> STG[STAGING views]
+    STG --> DR[dim_restaurants]
+    STG --> DC[dim_customer]
+    STG --> DF[dim_food]
+    STG --> FO[fct_orders]
+    STG --> FI[fact_order_items]
+    FO --> REV[mart_daily_city_revenue]
+    FO --> PERF[mart_restaurant_performance]
+    FO --> SLA[mart_delivery_sla]
+    FI --> REV
+    AI[(AI.REVIEW_ENRICHED)] --> INSIGHTS[mart_review_insights]
+```
+
+### 5. Orchestrate the daily workflow
+
+[`airflow/dags/zomato_batch.py`](airflow/dags/zomato_batch.py) defines one four-stage DAG:
+
+```text
+reload_raw → dbt_build_core → enrich_reviews → dbt_build_ai
+```
+
+Airflow reloads Snowflake raw tables, builds and tests the core dbt graph, enriches reviews, and finishes by building the AI-dependent mart.
+
+### 6. Add AI-assisted analytics
+
+The [`ai/`](ai/) directory contains three independent capabilities:
+
+| Application | Purpose | Safety/cost control |
+|---|---|---|
+| `enrich_reviews.py` | Converts review text into structured sentiment and topic fields | Skips processed reviews and supports `SAMPLE_N` |
+| `rag_chat.py` | Retrieves relevant reviews and answers questions using the retrieved evidence | Grounds responses in matching review records |
+| `text_to_sql.py` | Translates natural language into Snowflake queries | Applies a SELECT-only validation guard |
+
+The current defaults use `gpt-4o-mini` for generation and `text-embedding-3-small` for embeddings.
 
 ## Repository structure
 
-```
-├── airflow/                  # Airflow 3 on Docker
-│   ├── Dockerfile            #   Snowflake + OpenAI providers, dbt in its own venv
-│   ├── docker-compose.yaml   #   postgres + api-server + scheduler; creds via env vars
-│   ├── example.env           #   template for SNOWFLAKE_* / OPENAI_API_KEY
-│   └── dags/zomato_batch.py  #   the pipeline DAG (4 tasks)
-├── zomato/                   # dbt project
-│   ├── models/staging/       #   7 staging views (Silver) + sources + tests
-│   ├── models/marts/         #   dims, incremental facts, business marts (Gold)
-│   └── macros/               #   custom schema-name macro
-├── ai/                       # AI layer
-│   ├── enrich_reviews.py     #   LLM enrichment → ZOMATO.AI.REVIEW_ENRICHED
-│   ├── rag_chat.py           #   RAG — "chat with your reviews" (Streamlit)
-│   ├── text_to_sql.py        #   text-to-SQL — "chat with your warehouse" (Streamlit)
-│   └── example.env           #   template for the AI credentials
-├── aws/iam/                  # IAM policy + role trust policies for the S3 ↔ Snowflake handshake
-└── docs/architecture.png     # architecture diagram
-```
-
-> `data/` (~2.3 GB of CSVs), logs, and dbt `target/` artifacts are intentionally not committed — get the dataset and slides from the [Google Drive folder](https://drive.google.com/drive/folders/1FEnGWMHhHzzTUCZOw1-YnH2v3DMuM-rs?usp=sharing).
-
-## How the pipeline works
-
-### 1 · Data lands in S3
-
-The seven CSVs are uploaded to `s3://<BUCKET>/raw/<table>/` — one folder per table (`restaurants/`, `users/`, `food/`, `menu/`, `orders/`, `order_items/`, `reviews/`).
-
-### 2 · S3 → Snowflake: one keyless handshake
-
-Snowflake reads the bucket with **no stored keys**, using a storage integration + an IAM role. The JSON documents live in [`aws/iam/`](aws/iam/):
-
-| File | Used for |
-|---|---|
-| [`s3-read-policy.json`](aws/iam/s3-read-policy.json) | IAM **policy** `zomato-s3-read` — read-only access to the bucket |
-| [`snowflake-role-trust-policy-initial.json`](aws/iam/snowflake-role-trust-policy-initial.json) | IAM **role** `snowflake-s3-role` — placeholder trust used at creation time |
-| [`snowflake-role-trust-policy-final.json`](aws/iam/snowflake-role-trust-policy-final.json) | Final trust — Snowflake's IAM user ARN + external ID from `DESC INTEGRATION` |
-
-The order matters: create the AWS policy + role → create the Snowflake `STORAGE INTEGRATION` pointing at the role ARN → `DESC INTEGRATION` to get `STORAGE_AWS_IAM_USER_ARN` and `STORAGE_AWS_EXTERNAL_ID` → paste both into the role's trust policy. (Two hard-won lessons: the trust `Principal` must be Snowflake's IAM user ARN, not `:root` — and never re-run `CREATE OR REPLACE` on the integration afterward, it regenerates the external ID and breaks the trust.)
-
-### 3 · Load — `COPY INTO`
-
-`COPY INTO` pulls each file from the stage into `ZOMATO.RAW` tables: 10M orders, ~23M order items, 300K reviews.
-
-### 4 · Transform — dbt (medallion)
-
-- **Staging (Silver)** — one view per source: parse the messy restaurant dimension (`--` → null, `₹ 200` → 200), lowercase emails, derive `is_delivered`, etc.
-- **Dimensions (Gold)** — `dim_restaurants`, `dim_customer` (with age segments), `dim_food`, a generated `dim_date` calendar.
-- **Facts (Gold, incremental)** — `fct_orders` and `fact_order_items` use `materialized='incremental'` with a MERGE strategy, so a re-run processes only new rows instead of rebuilding 10M+.
-- **Marts (Gold)** — one table per business question: daily city revenue (GMV/AOV/cancel rate), restaurant performance, delivery SLA (p50/p90 by city & hour), review insights.
-- **Tests** — `unique` / `not_null` / `relationships` / `accepted_values` plus a singular reconciliation test; `dbt build` runs models and tests in dependency order.
-
-### 5 · Orchestrate — Airflow
-
-One daily DAG, [`zomato_batch`](airflow/dags/zomato_batch.py), runs the whole thing as a single graph:
-
-```
-reload_raw  →  dbt_build_core  →  enrich_reviews  →  dbt_build_ai
-(COPY from S3)  (dbt build + tests)  (OpenAI enrichment)   (AI mart)
+```text
+Zomato-AI-Data-Engineering-End-to-End/
+├── airflow/
+│   ├── dags/zomato_batch.py
+│   ├── docker-compose.yaml
+│   ├── Dockerfile
+│   └── example.env
+├── ai/
+│   ├── enrich_reviews.py
+│   ├── rag_chat.py
+│   ├── text_to_sql.py
+│   └── example.env
+├── aws/iam/
+├── docs/architecture.png
+└── zomato/
+    ├── models/staging/
+    ├── models/marts/
+    ├── macros/
+    └── dbt_project.yml
 ```
 
-Credentials never touch the code: docker-compose injects `SNOWFLAKE_*` env vars (read by dbt's `profiles.yml` via `env_var()`) and an `AIRFLOW_CONN_SNOWFLAKE_DEFAULT` connection for the COPY task.
+## Getting started
 
-### 6 · AI layer — three capabilities
+### Prerequisites
 
-1. **LLM enrichment** (`ai/enrich_reviews.py`) — *LLM as a transformation step.* Reads review text, asks `gpt-4o-mini` for structured JSON (sentiment + topic), writes it back to `ZOMATO.AI.REVIEW_ENRICHED` — which dbt then models into `mart_review_insights` like any other table. Idempotent and sample-capped (`SAMPLE_N`) so you never pay twice for the same review.
-2. **RAG** (`ai/rag_chat.py`) — *chat with your reviews.* Embeds reviews, retrieves the most similar ones for a question, and generates an answer grounded in real reviews (with sources).
-3. **Text-to-SQL** (`ai/text_to_sql.py`) — *chat with your warehouse.* The LLM gets the marts' schema, writes Snowflake SQL for an English question, and a SELECT-only guard validates it before running as `DBT_ROLE`.
+- An AWS account and S3 bucket
+- A Snowflake account, warehouse, database, and role
+- Docker with Compose support
+- Python 3.10+
+- A dbt-compatible Python environment for local dbt commands
+- An OpenAI API key for the optional AI components
 
-## Running it
+### 1. Clone the project
 
 ```bash
-# Snowflake objects (warehouse ZOMATO_WH, database ZOMATO, schemas RAW/STAGING/MARTS/SNAPSHOTS/AI, role DBT_ROLE)
-# + the S3 storage integration are created in Snowsight — see aws/iam/ for the AWS side.
-
-# dbt
-cd zomato
-export SNOWFLAKE_ACCOUNT=... SNOWFLAKE_USER=... SNOWFLAKE_PASSWORD=...
-dbt debug && dbt build --exclude tag:ai
-
-# Airflow
-cd airflow
-cp example.env .env          # fill SNOWFLAKE_* , OPENAI_API_KEY, SAMPLE_N
-docker compose build && docker compose up -d
-# http://localhost:8080 → un-pause zomato_batch → Trigger
-
-# AI apps
-export OPENAI_API_KEY=sk-...
-python ai/enrich_reviews.py
-streamlit run ai/rag_chat.py      # chat with reviews
-streamlit run ai/text_to_sql.py   # chat with the warehouse
+git clone https://github.com/aromalrm/Zomato-AI-Data-Engineering-End-to-End.git
+cd Zomato-AI-Data-Engineering-End-to-End
 ```
+
+Prepare the seven source CSVs locally, upload them to their corresponding S3 prefixes, and keep the local data directory outside version control.
+
+### 2. Configure AWS and Snowflake
+
+1. Create the S3 read policy and IAM role using the templates in `aws/iam/`.
+2. Create the Snowflake storage integration using that role ARN.
+3. Retrieve the Snowflake IAM user ARN and external ID with `DESC INTEGRATION`.
+4. Apply those values to the final IAM trust policy.
+5. Create the `ZOMATO` schemas and raw tables, then configure the stage and file format.
+
+### 3. Build the core dbt project
+
+Create `zomato/profiles.yml` locally. This file is ignored by Git and is required by both the dbt CLI and the Airflow DAG:
+
+```yaml
+zomato:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: DBT_ROLE
+      database: ZOMATO
+      warehouse: ZOMATO_WH
+      schema: STAGING
+      threads: 4
+```
+
+Then export the matching environment variables and build the non-AI models:
+
+```bash
+cd zomato
+export SNOWFLAKE_ACCOUNT="..."
+export SNOWFLAKE_USER="..."
+export SNOWFLAKE_PASSWORD="..."
+dbt deps
+dbt debug
+dbt build --exclude tag:ai
+```
+
+On Windows PowerShell, set environment variables with `$env:SNOWFLAKE_ACCOUNT = "..."` and the corresponding user/password commands.
+
+### 4. Start Airflow
+
+```bash
+cd ../airflow
+cp example.env .env
+docker compose build
+docker compose up -d
+```
+
+Fill `.env` with the required `SNOWFLAKE_*`, `OPENAI_API_KEY`, and `SAMPLE_N` values before starting the stack. Open [http://localhost:8080](http://localhost:8080), unpause `zomato_batch`, and trigger a run.
+
+### 5. Run the AI applications
+
+```bash
+python ai/enrich_reviews.py
+streamlit run ai/rag_chat.py
+streamlit run ai/text_to_sql.py
+```
+
+## Configuration and security
+
+- Never commit `.env` files, AWS keys, Snowflake passwords, or OpenAI API keys.
+- Prefer a Snowflake storage integration over inline AWS credentials.
+- Give the Snowflake/dbt role only the privileges required by the pipeline.
+- Review generated SQL before expanding the text-to-SQL guard beyond read-only statements.
+- Use `SAMPLE_N` during development to bound enrichment cost.
+- Large warehouse and AI runs can incur Snowflake, AWS, and OpenAI charges.
+
+## Operational notes
+
+- Incremental facts assume the configured source keys and timestamps reliably identify new or changed records.
+- Rerun `dbt build --full-refresh` only when a complete rebuild is intentional.
+- Airflow receives credentials through environment variables and its Snowflake connection configuration.
+- The source datasets are demonstration data and should not be treated as current Zomato production data.
+
+## Tech stack
+
+Python · pandas · Amazon S3 · Snowflake · dbt-snowflake · Apache Airflow · Docker Compose · OpenAI · Streamlit
